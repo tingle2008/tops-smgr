@@ -1,0 +1,207 @@
+#!/home/tops/bin/python
+
+import sys,os,stat,pwd
+import shutil
+import hashlib
+from optparse import OptionParser
+
+try:
+    import syck as yaml_loader
+except ImportError:
+    import yaml as yaml_loader
+
+smgr_dir    = "/etc/tops-smgr"
+raw_dir     = "/usr/local/gemclient/raw/smgrconf"
+prefix      = "smgr"
+service_dir = "/service"
+default_config = "/etc/smgr.conf"
+
+config_dict = dict()
+
+svc_cmd = "/usr/local/bin/svc"
+
+
+content = dict()
+
+content['logrun'] = """#!/bin/sh
+
+chown -R nobody ./main
+exec setuidgid nobody multilog t I s200000 n5 ./main
+"""
+
+def compare_file(src,dst):
+    try:
+        src_md5 = hashlib.md5(open(src,'r').read()).hexdigest()
+        dst_md5 = hashlib.md5(open(dst,'r').read()).hexdigest()
+    except  IOError as e:
+        return True
+    return (src_md5 != dst_md5)
+
+def setup_service(srv_name):
+    mandatory = ['run','config','dir']
+    print "setup_service:%s-%s" % (prefix,srv_name)
+    ret     = 0
+    src     = "%s/%s-%s" % (smgr_dir,prefix,srv_name)
+    src_log = "%s/log" % src
+
+    dst = "%s/%s-%s" % (service_dir,prefix,srv_name)
+    srv_type,srv_name = srv_name.split("-")
+
+    files = filter(lambda (src,dst): src != 'type', config_dict[srv_name].items())
+
+    for m in mandatory:
+        if m not in dict(files).keys():
+            print "run/config/dir is mandatory items"
+            return 1
+
+
+    #check and generate log/run files
+    if not os.path.exists(src_log):
+        os.makedirs("%s/main" % src_log)
+        os.chown("%s/main" % src_log, pwd.getpwnam('nobody')[2],pwd.getpwnam('nobody')[3])
+
+        log_run = "%s/run" % src_log
+        log_run_fh = open(log_run,'w')
+        log_run_fh.write(content['logrun'])
+        log_run_fh.close()
+        os.chmod(log_run,0755)
+
+    #check  and copy  run/conf/dir files
+    for key,value in dict(files).items():
+        if key == 'type':
+            # do something at here?
+            continue
+        raw_file = "%s/%s/%s" % (raw_dir,key,value)
+        if not os.path.exists(raw_file):
+            print "%s dosen't exist!" % raw_file
+            return 1
+        if not os.path.exists(src):
+            os.makedirs(src)
+
+        if key == 'run':
+            src_run = "%s/run" % src
+            ret += smgr_copy(raw_file,src_run,compare_file)
+            os.chmod(src_run,0755)
+
+        if key == 'config':
+            src_conf = "%s/config" % src
+            ret += smgr_copy(raw_file,src_conf,compare_file)
+
+        if key == 'dir':
+            src_dir = "%s/dir" % src
+            if not os.path.exists(src_dir):
+                os.makedirs(src_dir)
+            ret += smgr_copy_dir(raw_file,src_dir)
+
+    
+    if os.path.islink(dst) and ret != 0:
+        svc_restart = "%s -t %s %s/log" % (svc_cmd,dst,dst)
+        print "restarting %s-%s" % (prefix,srv_name)
+        os.system(svc_restart)
+
+    if not os.path.islink(dst):
+        
+        os.symlink(src,dst)
+
+def remove_service(srv_name):
+    print "remove_service:%s-%s" % (prefix,srv_name)
+    dst = "%s/%s-%s" % (service_dir,prefix,srv_name)
+    os.unlink(dst)
+    srv_dir = "%s/%s-%s" % (smgr_dir,prefix,srv_name)
+    svc_stop = "%s -dx %s %s/log" % (svc_cmd,srv_dir,srv_dir)
+    os.system(svc_stop)
+    os.system("/bin/rm -r %s" % srv_dir)
+
+
+def smgr_copy(src,dst,comp_fun):
+    if comp_fun(src,dst):
+        print "%s -> %s " % (src,dst)
+        shutil.copyfile(src,dst)
+        return 1
+    print "%s was not changed [pass]" % dst
+    return 0
+
+def smgr_copy_dir(src_dir,dst_dir):
+
+    ret = 0
+    for item in os.listdir(src_dir):
+        subpath = os.path.join(src_dir, item)
+        mode = os.stat(subpath)[stat.ST_MODE]
+        if stat.S_ISDIR(mode):
+            dst_path = "%s/%s" % (dst_dir,item)
+            if not os.path.exists(dst_path):
+                os.mkdir(dst_path)
+            smgr_copy_dir(subpath,"%s/%s" % (dst_dir,item))
+        elif stat.S_ISREG(mode):
+            ret += smgr_copy(subpath,"%s/%s" % (dst_dir,item), compare_file)
+        else:
+            print "unkown file status and ignore it."
+            
+    return ret
+            
+    
+def get_services(dirname):
+    ln = list()
+    for name in os.listdir(dirname):
+        if name.startswith("%s-" % prefix):
+            if name not in (os.curdir, os.pardir):
+                full = os.path.join(dirname, name)
+                if os.path.islink(full):
+                    ln.append(name.replace("%s-" % prefix ,""))
+    return ln
+
+def sync_services():
+    cur_srv   = get_services(service_dir)
+    conf_srv  = list()
+
+    try:
+        f = open(default_config)
+    except IOError as e:
+        print "%s config file not found" % default_config
+        sys.exit(1)
+        
+    global config_dict
+    config_dict = yaml_loader.load(f)
+    
+
+    try:
+        for srv_name,params in  config_dict.items():
+            conf_srv.append("%s-%s" % (params['type'],srv_name))
+    except  AttributeError as e:
+        print "no service config item found"
+    
+    should_remove = list(set(cur_srv) - set(conf_srv))
+
+    if should_remove:
+        map(remove_service,should_remove)
+
+    # should_create = list(set(conf_srv) - set(cur_srv))
+    should_sync = list(set(conf_srv))
+    if should_sync:
+        map(setup_service,should_sync)
+
+
+# def get_service():
+    # os.glob(service_dir)
+#for service_name in tunnel_dict.keys():
+#    if(os.path.exists("%s/$s" % service_dir,service_name)):
+
+# sync_services()
+
+# smgr_copy("%s/service-manager.conf/tuncli.conf" % raw_dir ,"/tmp/aa.conf",compare_file)
+
+        
+if 0 != os.getuid():
+    print >> sys.stderr, 'become root first!!'
+    exit(1)
+
+usage = "usage: %prog [options]  -c config"
+parser = OptionParser(usage=usage)
+parser.add_option("-c","--config",type = "string",help="config file",dest = "config" )
+
+(options,args) = parser.parse_args()
+
+if options.config:
+    default_config = options.config
+
+sync_services()
